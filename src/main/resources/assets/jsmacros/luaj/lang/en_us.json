@@ -1,4 +1,5 @@
 {
   "jsmacroslua.globalcontext": "Shared Global Context",
+  "jsmacroslua.splitglobalcontext": "Split Global Context",
   "jsmacroslua.settings.languages.lua": "Luaj"
 }

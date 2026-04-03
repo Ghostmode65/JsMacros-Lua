@@ -4,6 +4,7 @@ import org.luaj.vm2.Globals;
 import org.luaj.vm2.LuaClosure;
 import org.luaj.vm2.LuaError;
 import org.luaj.vm2.LuaValue;
+import org.luaj.vm2.Varargs;
 import org.luaj.vm2.lib.jse.CoerceJavaToLua;
 import org.luaj.vm2.lib.jse.JsePlatform;
 import xyz.wagyourtail.jsmacros.core.Core;
@@ -17,25 +18,138 @@ import xyz.wagyourtail.jsmacros.luaj.LuajExtension;
 import xyz.wagyourtail.jsmacros.luaj.config.LuajConfig;
 
 import java.io.File;
+import java.util.Map;
 
 public class LuajLanguageDefinition extends BaseLanguage<Globals, LuajScriptContext> {
 
-    public final Globals globalGlobals = JsePlatform.debugGlobals();
+    // global pools.
+    public static final Map<String, Globals> namedGlobals = new java.util.concurrent.ConcurrentHashMap<>();
+
+    public static final Map<String, LuajScriptContext> globalOwners = new java.util.concurrent.ConcurrentHashMap<>();
+
+    //ensure only one script occupies a pool.
+    private static final Map<String, Object> poolLocks = new java.util.concurrent.ConcurrentHashMap<>();
+    private static Object getLockFor(String poolName) {
+        return poolLocks.computeIfAbsent(poolName, k -> new Object());
+    }
 
     public LuajLanguageDefinition(LuajExtension extension, Core runner) {
         super(extension, runner);
     }
-    
+
+    private String getGlobalName(LuajScriptContext ctx) {
+        File file = ctx.getFile();
+        if (file == null) return null;
+        try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(file))) {
+            String line = br.readLine();
+            if (line == null) return null;
+            line = line.trim();
+            if (line.equals("--@global")) return "default";
+            if (line.startsWith("--@global ")) return line.substring("--@global ".length()).trim();
+        } catch (java.io.IOException ignored) {}
+        return null;
+    }
+
     protected void execContext(EventContainer<LuajScriptContext> ctx, Executor e) throws Exception {
+        LuajConfig cfg = runner.config.getOptions(LuajConfig.class);
         Globals globals;
-        
-        if (runner.config.getOptions(LuajConfig.class).useGlobalContext) globals = globalGlobals;
-        else globals = JsePlatform.debugGlobals();
+        String claimedPool = null;
+
+        if (cfg.useGlobalContext) {
+            if (cfg.splitGlobalContext) {
+                String poolName = getGlobalName(ctx.getCtx());
+                if (poolName != null) {
+                    synchronized (getLockFor(poolName)) {
+                        LuajScriptContext currentOwner = globalOwners.get(poolName);
+                        boolean slotFree = currentOwner == null || currentOwner.isContextClosed();
+                        if (slotFree) {
+                            globals = namedGlobals.computeIfAbsent(poolName, k -> JsePlatform.debugGlobals());
+                            globalOwners.put(poolName, ctx.getCtx());
+                            claimedPool = poolName;
+                        } else {
+                            globals = JsePlatform.debugGlobals();
+                        }
+                    }
+                } else {
+                    globals = JsePlatform.debugGlobals();
+                }
+            } else {
+                //If split context is off fallback to useGlobalContext
+                globals = namedGlobals.computeIfAbsent("default", k -> JsePlatform.debugGlobals());
+            }
+        } else {
+            globals = JsePlatform.debugGlobals();
+        }
+
         ctx.getCtx().setContext(globals);
-    
         retrieveLibs(ctx.getCtx()).forEach((name, lib) -> globals.set(name, CoerceJavaToLua.coerce(lib)));
-        
-        e.accept(globals);
+
+        final String finalClaimedPool = claimedPool;
+        try {
+            e.accept(globals);
+        } finally {
+            if (finalClaimedPool != null) {
+                synchronized (getLockFor(finalClaimedPool)) {
+                    globalOwners.remove(finalClaimedPool, ctx.getCtx());
+                }
+            }
+        }
+    }
+
+    /**
+     * Releases the current script from the pool, the global stays but is now just local to the script.
+     */
+    public static void releaseGlobal(LuajScriptContext ctx) {
+        for (Map.Entry<String, LuajScriptContext> entry : globalOwners.entrySet()) {
+            if (entry.getValue() == ctx) {
+                String poolName = entry.getKey();
+                synchronized (getLockFor(poolName)) {
+                    if (globalOwners.get(poolName) == ctx) {
+                        Globals current = namedGlobals.get(poolName);
+                        if (current != null) {
+                            namedGlobals.put(poolName, snapshotGlobals(current));
+                        }
+                        globalOwners.remove(poolName);
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    /**
+     * Copies the global table form a released script and will pass it to a new script.
+     */
+    private static Globals snapshotGlobals(Globals source) {
+        Globals fresh = JsePlatform.debugGlobals();
+        LuaValue k = LuaValue.NIL;
+        while (true) {
+            Varargs entry = source.next(k);
+            k = entry.arg1();
+            if (k.isnil()) break;
+            fresh.rawset(k, entry.arg(2));
+        }
+        return fresh;
+    }
+
+    public static boolean destroyPool(String poolName) {
+        synchronized (getLockFor(poolName)) {
+            LuajScriptContext owner = globalOwners.get(poolName);
+            if (owner != null && !owner.isContextClosed()) {
+                return false;
+            }
+            globalOwners.remove(poolName);
+            namedGlobals.remove(poolName);
+            poolLocks.remove(poolName);
+            return true;
+        }
+    }
+
+    public static String getOwnedPool(LuajScriptContext ctx) {
+        return globalOwners.entrySet().stream()
+            .filter(e -> e.getValue() == ctx)
+            .map(Map.Entry::getKey)
+            .findFirst().orElse(null);
     }
     
     private void setPerExecVar(BaseScriptContext<?> ctx, Globals globals, String name, LuaValue val) {

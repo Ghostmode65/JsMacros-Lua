@@ -14,6 +14,7 @@ import xyz.wagyourtail.jsmacros.core.library.BaseLibrary;
 import xyz.wagyourtail.jsmacros.luaj.config.LuajConfig;
 import xyz.wagyourtail.jsmacros.luaj.language.impl.LuajLanguageDefinition;
 import xyz.wagyourtail.jsmacros.luaj.library.impl.FWrapper;
+import xyz.wagyourtail.jsmacros.luaj.library.impl.LuajGlobalContextLib;
 
 import java.io.File;
 import java.util.Set;
@@ -30,8 +31,9 @@ public class LuajExtension implements Extension {
         } catch (IllegalAccessException | InstantiationException e) {
             throw new RuntimeException(e);
         }
-    
-        // pre-init
+
+	// pre-init
+
         Thread t = new Thread(() -> {
             try {
                 Globals globals = JsePlatform.standardGlobals();
@@ -84,7 +86,7 @@ public class LuajExtension implements Extension {
 
     @Override
     public Set<Class<? extends BaseLibrary>> getLibraries() {
-        return Sets.newHashSet(FWrapper.class);
+        return Sets.newHashSet(FWrapper.class, LuajGlobalContextLib.class);
     }
 
     @Override
